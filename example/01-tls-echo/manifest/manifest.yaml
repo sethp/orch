@@ -1,0 +1,52 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tls-echo
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes/io: tls-echo
+  replicas: 2
+  template:
+    metadata:
+      labels:
+        app.kubernetes/io: tls-echo
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      containers:
+      - name: tls-echo
+        image: tls-echo
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: https
+          containerPort: 8443
+        resources:
+          limits:
+            cpu: 150m
+            memory: 64Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - name: tls-echo
+          mountPath: /etc/tls
+      volumes:
+      - name: tls-echo
+        secret:
+          secretName: tls-echo
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tls-echo
+spec:
+  selector:
+    app.kubernetes/io: tls-echo
+  ports:
+  - port: 443
+    targetPort: https
