@@ -7,6 +7,8 @@ import (
 	"io/ioutil"
 	"os"
 
+	certmanagerv1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
+	cmmetav1 "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 	"github.com/spf13/pflag"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -15,7 +17,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/runtime/serializer/json"
 	"k8s.io/cli-runtime/pkg/resource"
-	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/discovery"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"sigs.k8s.io/controller-runtime/pkg/client/config"
 
 	"github.com/sethp/orch/example/01-tls-echo/manifest"
 )
@@ -23,13 +27,53 @@ import (
 var (
 	Args = struct {
 		Output string
+
+		Certs CertMode
 	}{
 		Output: "yaml",
+
+		Certs: CertModeAuto,
 	}
+
+	scheme = runtime.NewScheme()
 )
 
 func init() {
+	Must := func(fn func(*runtime.Scheme) error) {
+		if err := fn(scheme); err != nil {
+			panic(err)
+		}
+	}
+
+	Must(clientgoscheme.AddToScheme)
+	Must(certmanagerv1.AddToScheme)
+}
+
+type CertMode string
+
+var (
+	CertModeAuto    CertMode = "auto"
+	CertModeStatic  CertMode = "static"
+	CertModeManaged CertMode = "cert-manager"
+)
+
+func (c CertMode) String() string { return string(c) }
+func (c CertMode) Type() string   { return "CertMode" }
+
+func (c *CertMode) Set(s string) error {
+	cc := CertMode(s)
+	switch cc {
+	case CertModeAuto, CertModeStatic, CertModeManaged:
+		*c = cc
+		return nil
+	default:
+		return fmt.Errorf("unrecognized cert mode: %q", s)
+	}
+}
+
+func init() {
 	pflag.StringVarP(&Args.Output, "output", "o", Args.Output, "output: yaml or json")
+	pflag.Var(&Args.Certs, "certs", "certs: static, cert-manager, or auto (discover)")
 }
 
 func RunCommandLine() error {
@@ -83,34 +127,100 @@ func RunCommandLine() error {
 			return errors.New("couldn't find deployment")
 		}
 
-		certBytes, keyBytes, err := func() (certBytes []byte, keyBytes []byte, err error) {
-			// Or, consider: generating a certificate here
-			certBytes, err = ioutil.ReadFile("server.crt")
-			if err != nil {
+		useStaticCerts := func() error {
+			certBytes, keyBytes, err := func() (certBytes []byte, keyBytes []byte, err error) {
+				// Or, consider: generating a certificate here
+				certBytes, err = ioutil.ReadFile("server.crt")
+				if err != nil {
+					return
+				}
+
+				keyBytes, err = ioutil.ReadFile("server.key")
 				return
+			}()
+			if err != nil {
+				return err
 			}
 
-			keyBytes, err = ioutil.ReadFile("server.key")
-			return
-		}()
-		if err != nil {
-			return err
+			// See also:
+			// `kubectl create secret tls tls-echo --cert=./server.crt --key=./server.key -o yaml --dry-run=client`
+			objs = append(objs, &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: deploy.GetName(),
+				},
+				Type: corev1.SecretTypeTLS,
+				Data: map[string][]byte{
+					"tls.crt": certBytes,
+					"tls.key": keyBytes,
+				},
+			})
+			return nil
 		}
 
-		// See also:
-		// `kubectl create secret tls tls-echo --cert=./server.crt --key=./server.key -o yaml --dry-run=client`
-		objs = append(objs, &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: deploy.GetName(),
-			},
-			Type: corev1.SecretTypeTLS,
-			Data: map[string][]byte{
-				"tls.crt": certBytes,
-				"tls.key": keyBytes,
-			},
-		})
+		useCertManager := func() error {
+			objs = append(objs,
+				&certmanagerv1.Issuer{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: deploy.GetName(),
+					},
+					Spec: certmanagerv1.IssuerSpec{
+						IssuerConfig: certmanagerv1.IssuerConfig{
+							SelfSigned: &certmanagerv1.SelfSignedIssuer{},
+						},
+					},
+				},
+				&certmanagerv1.Certificate{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: deploy.GetName(),
+					},
+					Spec: certmanagerv1.CertificateSpec{
+						IssuerRef: cmmetav1.ObjectReference{
+							Kind: "Issuer",
+							Name: deploy.GetName(),
+						},
+						CommonName: "cert-manager-cert",
+						DNSNames: []string{
+							"localhost",
+						},
+						IPAddresses: []string{
+							"127.0.0.1",
+						},
+						SecretName: deploy.GetName(),
+					},
+				},
+			)
 
-		return nil
+			return nil
+		}
+
+		switch Args.Certs {
+		case CertModeStatic:
+			return useStaticCerts()
+		case CertModeManaged:
+			return useCertManager()
+		default:
+			// TODO this could be more convenient (the `schema` knows this mapping already)
+			gvk := schema.GroupVersionKind{
+				Group:   certmanagerv1.SchemeGroupVersion.Group,
+				Version: certmanagerv1.SchemeGroupVersion.Version,
+				Kind:    "Certificate", // it would be better to sniff both, but either is probably fine
+			}
+			cfg := config.GetConfigOrDie()
+			disc := discovery.NewDiscoveryClientForConfigOrDie(cfg)
+
+			res, err := disc.ServerResourcesForGroupVersion(gvk.GroupVersion().String())
+			if err != nil {
+				return err
+			}
+
+			for _, r := range res.APIResources {
+				if r.Kind == gvk.Kind {
+					return useCertManager()
+				}
+			}
+
+			return useStaticCerts()
+		}
 	}()
 
 	if err != nil {
@@ -119,7 +229,7 @@ func RunCommandLine() error {
 	// END CUSTOM LOGIC
 
 	dst := os.Stdout
-	var typer runtime.ObjectTyper = scheme.Scheme
+	var typer runtime.ObjectTyper = scheme
 
 	type Type interface {
 		GroupVersionKind() schema.GroupVersionKind
