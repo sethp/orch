@@ -1,0 +1,10 @@
+# linters:
+#   enable-all: true
+
+linters:
+  enable:
+  # - wrapcheck
+  # - goerr113
+  - revive
+  - gocritic
+  # - godox

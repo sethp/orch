@@ -242,13 +242,14 @@ func RunCommandLine() error {
 		}
 
 		types, _, err := typer.ObjectKinds(obj)
-		if runtime.IsNotRegisteredError(err) {
+		switch {
+		case runtime.IsNotRegisteredError(err):
 			// This'd be snazzier if it suggested `blahv1.AddToScheme`
 			return fmt.Errorf("scheme didn't recognize object of type %T (did you forget the relevant group's `AddToScheme`?): %w", obj, err)
-		} else if err != nil {
+		case err != nil:
 			return fmt.Errorf("setting type info for %T: %w", obj, err)
-		} else if len(types) != 1 {
-			return fmt.Errorf("confused by the number of versions (%d) for struct %T", len(types), obj)
+		case len(types) != 1:
+			return fmt.Errorf("confused by the number of versions (%d, expected 1) for struct %T", len(types), obj)
 		}
 
 		o.SetGroupVersionKind(types[0])
